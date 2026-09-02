@@ -3,6 +3,7 @@
 #include <cuda_runtime.h>
 
 #include <cstddef>
+#include <cstdint>
 
 namespace ninfer {
 
@@ -28,6 +29,13 @@ inline constexpr int kTargetSmCount = 82; // NVIDIA GeForce RTX 3090
 #error "NInfer requires NINFER_SM86 or NINFER_SM89"
 #endif
 
+// Non-owning execution facts passed to Ops whose launch policy depends on physical device
+// capacity. DeviceContext remains the owner and authoritative source of both values.
+struct DeviceExecutionView {
+    cudaStream_t stream               = nullptr;
+    std::int32_t multiprocessor_count = 0;
+};
+
 struct DeviceContext {
     int device               = 0;
     cudaStream_t stream      = nullptr;
@@ -43,6 +51,8 @@ struct DeviceContext {
     DeviceContext& operator=(DeviceContext&& other) noexcept;
 
     int sm() const noexcept;
+    int multiprocessor_count() const noexcept;
+    DeviceExecutionView execution_view() const noexcept;
     std::size_t total_vram() const noexcept;
     void synchronize() const;
     void set_persisting_l2_window(const void* ptr, std::size_t num_bytes,

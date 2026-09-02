@@ -309,7 +309,8 @@ Result run_case(Resources& resources, ninfer::DeviceBuffer& flush, cudaStream_t 
         const bool fused_norm_control = options.norm_control == "fused";
         if (fused_norm_control) {
             ops::gdn_norm_gating_proj(residual, input_norm, kEps, resources.control_weight, a_log,
-                                      dt_bias, resources.workspace, hidden, g, beta, s);
+                                      dt_bias, resources.workspace, hidden, g, beta,
+                                      DeviceExecutionView{s, device_sm_count()});
         } else {
             ops::rmsnorm(residual, input_norm, kEps, true, hidden, s);
         }
@@ -327,7 +328,8 @@ Result run_case(Resources& resources, ninfer::DeviceBuffer& flush, cudaStream_t 
         }
         if (!fused_norm_control) {
             ops::gdn_gating_proj(hidden, resources.control_weight, a_log, dt_bias,
-                                 resources.workspace, g, beta, s);
+                                 resources.workspace, g, beta,
+                                 DeviceExecutionView{s, device_sm_count()});
         }
         Tensor q_recurrent       = q.view({kHeadDim, kQkHeads, tokens});
         Tensor k_recurrent       = k.view({kHeadDim, kQkHeads, tokens});

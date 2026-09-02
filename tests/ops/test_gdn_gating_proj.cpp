@@ -214,7 +214,8 @@ int verify_inputs_unchanged(const std::string& label, const DeviceBuffer& device
     return failures;
 }
 
-int run_projection_case(const Geometry& geometry, std::int32_t tokens, std::uint32_t seed) {
+int run_projection_case(const Geometry& geometry, std::int32_t tokens, std::uint32_t seed,
+                        DeviceExecutionView execution) {
     std::vector<float> x(static_cast<std::size_t>(geometry.hidden) * tokens);
     std::vector<float> a_weight(static_cast<std::size_t>(geometry.heads) * geometry.hidden);
     std::vector<float> b_weight(static_cast<std::size_t>(geometry.heads) * geometry.hidden);
@@ -263,12 +264,12 @@ int run_projection_case(const Geometry& geometry, std::int32_t tokens, std::uint
     if (geometry.parent_weight) {
         Weight parent = bf16_weight(device_weight.p, 2 * geometry.heads, geometry.hidden);
         ops::gdn_gating_proj(tensor_x, parent, tensor_a_log, tensor_dt_bias, workspace, tensor_g,
-                             tensor_beta, nullptr);
+                             tensor_beta, execution);
     } else {
         Weight weight_a = bf16_weight(device_weight.p, geometry.heads, geometry.hidden);
         Weight weight_b = bf16_weight(device_b_weight.p, geometry.heads, geometry.hidden);
         ops::gdn_gating_proj(tensor_x, weight_a, weight_b, tensor_a_log, tensor_dt_bias, workspace,
-                             tensor_g, tensor_beta, nullptr);
+                             tensor_g, tensor_beta, execution);
     }
     cuda_synchronize();
 
@@ -299,7 +300,8 @@ int run_projection_case(const Geometry& geometry, std::int32_t tokens, std::uint
     return failures;
 }
 
-int run_norm_projection_case(const Geometry& geometry, std::int32_t tokens, std::uint32_t seed) {
+int run_norm_projection_case(const Geometry& geometry, std::int32_t tokens, std::uint32_t seed,
+                             DeviceExecutionView execution) {
     constexpr float kEps = 1.0e-6F;
     std::vector<float> x(static_cast<std::size_t>(geometry.hidden) * tokens);
     std::vector<float> norm_weight(static_cast<std::size_t>(geometry.hidden));
@@ -359,13 +361,13 @@ int run_norm_projection_case(const Geometry& geometry, std::int32_t tokens, std:
         Weight parent = bf16_weight(device_weight.p, 2 * geometry.heads, geometry.hidden);
         ops::gdn_norm_gating_proj(tensor_x, tensor_norm_weight, kEps, parent, tensor_a_log,
                                   tensor_dt_bias, workspace, tensor_h, tensor_g, tensor_beta,
-                                  nullptr);
+                                  execution);
     } else {
         Weight weight_a = bf16_weight(device_weight.p, geometry.heads, geometry.hidden);
         Weight weight_b = bf16_weight(device_b_weight.p, geometry.heads, geometry.hidden);
         ops::gdn_norm_gating_proj(tensor_x, tensor_norm_weight, kEps, weight_a, weight_b,
                                   tensor_a_log, tensor_dt_bias, workspace, tensor_h, tensor_g,
-                                  tensor_beta, nullptr);
+                                  tensor_beta, execution);
     }
     cuda_synchronize();
 
@@ -434,6 +436,8 @@ int main() {
         return 77;
     }
 
+    DeviceContext device;
+    const DeviceExecutionView execution{nullptr, device.multiprocessor_count()};
     int failures = 0;
     failures += verify_workspace_capacity_contract(
         kQwen27, {1, 8, 1280, 1281, 2688, 2689, 5376, 5377});
@@ -445,22 +449,23 @@ int main() {
     for (const std::int32_t tokens :
          {1, 8, 9, 768, 1024, 1280, 1281, 2049, 2688, 2689, 5376, 5377}) {
         failures +=
-            run_projection_case(kQwen27, tokens, 0x1000u + static_cast<std::uint32_t>(tokens));
+            run_projection_case(kQwen27, tokens, 0x1000u + static_cast<std::uint32_t>(tokens),
+                                execution);
     }
     // Every registered 35B projection route and its contiguous-parent storage contract.
     for (const std::int32_t tokens : {1, 127, 128, 1024, 1025, 2049, 4097}) {
-        failures +=
-            run_projection_case(kQwen35, tokens, 0x2000u + static_cast<std::uint32_t>(tokens));
+        failures += run_projection_case(kQwen35, tokens,
+                                        0x2000u + static_cast<std::uint32_t>(tokens), execution);
     }
 
     // 27B uses the composed implementation; 35B also qualifies both sides of its fused boundary.
-    failures += run_norm_projection_case(kQwen27, 1, 0x3001u);
-    failures += run_norm_projection_case(kQwen27, 9, 0x3009u);
-    failures += run_norm_projection_case(kQwen27, 64, 0x3040u);
-    failures += run_norm_projection_case(kQwen35, 1, 0x4001u);
-    failures += run_norm_projection_case(kQwen35, 16, 0x4010u);
-    failures += run_norm_projection_case(kQwen35, 17, 0x4011u);
-    failures += run_norm_projection_case(kQwen35, 64, 0x4040u);
+    failures += run_norm_projection_case(kQwen27, 1, 0x3001u, execution);
+    failures += run_norm_projection_case(kQwen27, 9, 0x3009u, execution);
+    failures += run_norm_projection_case(kQwen27, 64, 0x3040u, execution);
+    failures += run_norm_projection_case(kQwen35, 1, 0x4001u, execution);
+    failures += run_norm_projection_case(kQwen35, 16, 0x4010u, execution);
+    failures += run_norm_projection_case(kQwen35, 17, 0x4011u, execution);
+    failures += run_norm_projection_case(kQwen35, 64, 0x4040u, execution);
 
     std::cout << (failures == 0 ? "OK" : "FAIL") << " gdn_gating_proj correctness\n";
     return failures == 0 ? 0 : 1;
