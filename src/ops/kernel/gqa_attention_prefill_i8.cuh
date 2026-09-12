@@ -4,6 +4,10 @@
 // m16n8k32.s8 Tensor Cores; V alone is dequantized with packed FP16 arithmetic while
 // producer warps execute QK. Sixteen warps split each 16-row FP16 PV output across
 // four 64-dimension slices.
+//
+// sm_89 runs a retuned schedule: eight paired producer warps (Bc column halves, one named-barrier
+// max exchange per tile), byte-permute V dequant, fp16-accumulated PV tiles merged into fp32, and
+// the full 128-register budget. See the ColSplit constant.
 
 #include <cuda_bf16.h>
 #include <cuda_fp16.h>
@@ -40,14 +44,19 @@ inline constexpr int kGqaPrefillI8ScaleBytes =
     2 * kGqaPrefillI8Bc * kGqaPrefillI8Groups * static_cast<int>(sizeof(__half));
 inline constexpr int kGqaPrefillI8StatsBytes =
     2 * kGqaPrefillI8Br * static_cast<int>(sizeof(float));
+// Block-max and block-sum exchange slots for the paired-producer schedule (two column halves
+// per 16-row tile). Allocated on every arch so the launch envelope stays uniform.
+inline constexpr int kGqaPrefillI8PairStatsBytes = 2 * 2 * kGqaPrefillI8Br *
+                                                   static_cast<int>(sizeof(float));
 inline constexpr int kGqaPrefillI8SmemBytes = kGqaPrefillI8QBytes + kGqaPrefillI8QScaleBytes +
                                               kGqaPrefillI8KBytes + kGqaPrefillI8VBytes +
                                               kGqaPrefillI8VStageBytes + kGqaPrefillI8PBytes +
-                                              kGqaPrefillI8ScaleBytes + kGqaPrefillI8StatsBytes;
+                                              kGqaPrefillI8ScaleBytes + kGqaPrefillI8StatsBytes +
+                                              kGqaPrefillI8PairStatsBytes;
 
 static_assert(kGqaPrefillI8Groups == 4);
 static_assert(kGqaPrefillI8DConsumers == 4);
-static_assert(kGqaPrefillI8SmemBytes == 92672);
+static_assert(kGqaPrefillI8SmemBytes == 93696);
 
 __device__ __forceinline__ void gqa_prefill_i8_store_swz(std::int8_t* tile, int row, int d,
                                                          std::int8_t code) {
@@ -65,9 +74,26 @@ __device__ __forceinline__ int gqa_prefill_i8_p_swz(int row, int col) {
 __device__ __forceinline__ int4 gqa_prefill_i8_dequant_f16x8(const std::int8_t* codes8,
                                                              __half scale) {
     const int2 raw       = load_vec<int2>(codes8);
-    const std::int8_t* c = reinterpret_cast<const std::int8_t*>(&raw);
     const __half2 s2     = __halves2half2(scale, scale);
     unsigned packed[4];
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ == 890
+    // Ada throttles on the conversion pipe, so build the halves with byte permutes instead: bias
+    // each code to unsigned, splice it under exponent 2^10 (0x64xx is 1024 + code), and subtract
+    // 1024 + 128. Integer halves are exact, so the result is bit-identical to the I2F path.
+    const __half2 magic2 = __halves2half2(__ushort_as_half(0x6480), __ushort_as_half(0x6480));
+    const unsigned x0    = static_cast<unsigned>(raw.x) ^ 0x80808080u;
+    const unsigned x1    = static_cast<unsigned>(raw.y) ^ 0x80808080u;
+#pragma unroll
+    for (int i = 0; i < 4; ++i) {
+        const unsigned src = i < 2 ? x0 : x1;
+        const unsigned pair =
+            __byte_perm(src, 0x64646464u, (i & 1) ? 0x7352u : 0x7150u);
+        const __half2 code2 = __hsub2(*reinterpret_cast<const __half2*>(&pair), magic2);
+        const __half2 value2 = __hmul2(code2, s2);
+        packed[i]            = *reinterpret_cast<const unsigned*>(&value2);
+    }
+#else
+    const std::int8_t* c = reinterpret_cast<const std::int8_t*>(&raw);
 #pragma unroll
     for (int i = 0; i < 4; ++i) {
         const __half2 code2 =
@@ -75,6 +101,7 @@ __device__ __forceinline__ int4 gqa_prefill_i8_dequant_f16x8(const std::int8_t* 
         const __half2 value2 = __hmul2(code2, s2);
         packed[i]            = *reinterpret_cast<const unsigned*>(&value2);
     }
+#endif
     return make_int4(static_cast<int>(packed[0]), static_cast<int>(packed[1]),
                      static_cast<int>(packed[2]), static_cast<int>(packed[3]));
 }
@@ -361,9 +388,17 @@ __launch_bounds__(256) __global__ void gqa_attention_prefill_fill_i8_page_kernel
     }
 }
 
+// 120 registers is the spill-free point on SM120. Ada codegen spills the producer score/accumulator
+// state at 120, so give it the full file: 512 threads x 128 = 64K registers, and occupancy is
+// capped at one CTA by shared memory either way.
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ == 890
+#define NINFER_GQA_PREFILL_I8_MAXNREG 128
+#else
+#define NINFER_GQA_PREFILL_I8_MAXNREG 120
+#endif
 template <typename Geometry, bool PackedV, bool RotateK, bool RotateV, bool PackedK,
           bool E8Root = false, typename Metadata>
-__global__ __maxnreg__(120) void gqa_attention_prefill_i8_kernel(
+__global__ __maxnreg__(NINFER_GQA_PREFILL_I8_MAXNREG) void gqa_attention_prefill_i8_kernel(
     const __nv_bfloat16* __restrict__ q, const std::int8_t* __restrict__ cache_k,
     const std::uint8_t* __restrict__ cache_v, const __half* __restrict__ cache_k_scale,
     const __half* __restrict__ cache_v_scale, Metadata metadata,
@@ -378,9 +413,18 @@ __global__ __maxnreg__(120) void gqa_attention_prefill_i8_kernel(
     constexpr int QKNt          = Bc / 8;
     constexpr int PVNtPerWarp   = D / (kGqaPrefillI8DConsumers * 8);
     constexpr int PVKs          = Bc / 16;
-    constexpr int ProducerWarps = kGqaPrefillI8RowTiles;
+    // Ada runs one CTA per SM; four producer warps (one per scheduler) cannot hide mma latency and
+    // leave twelve workers stalled at the phase barrier. Split each 16-row score tile across a warp
+    // pair (column halves of Bc) there. SM120 keeps 4/12.
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ == 890
+    constexpr int ColSplit = 2;
+#else
+    constexpr int ColSplit = 1;
+#endif
+    constexpr int ProducerWarps = kGqaPrefillI8RowTiles * ColSplit;
     constexpr int VWorkerWarps  = kGqaPrefillI8Warps - ProducerWarps;
     constexpr int WorkerThreads = VWorkerWarps * 32;
+    constexpr int QKNtL         = QKNt / ColSplit;
     constexpr float Log2E       = 1.4426950408889634074f;
     constexpr unsigned FullMask = 0xffffffffu;
 
@@ -401,6 +445,8 @@ __global__ __maxnreg__(120) void gqa_attention_prefill_i8_kernel(
     __half* v_scale_s    = k_scale_s + Bc * Groups;
     float* alpha_s       = reinterpret_cast<float*>(v_scale_s + Bc * Groups);
     float* final_l_s     = alpha_s + Br;
+    float* pair_m_s      = final_l_s + Br;
+    float* pair_l_s      = pair_m_s + 2 * Br;
     __nv_bfloat16* q_b16 = reinterpret_cast<__nv_bfloat16*>(q_i8);
     __nv_bfloat16* k_b16 = reinterpret_cast<__nv_bfloat16*>(k_i8);
 
@@ -601,7 +647,7 @@ __global__ __maxnreg__(120) void gqa_attention_prefill_i8_kernel(
     float q_scale_r0[Groups - 2];
     float q_scale_r1[Groups - 2];
     if (warp < ProducerWarps) {
-        const int scale_row0 = warp * 16 + gid;
+        const int scale_row0 = (warp / ColSplit) * 16 + gid;
         const int scale_row1 = scale_row0 + 8;
 #pragma unroll
         for (int grp = 0; grp < Groups - 2; ++grp) {
@@ -627,14 +673,21 @@ __global__ __maxnreg__(120) void gqa_attention_prefill_i8_kernel(
     // Phase 1: Fully Causal Interior Tiles
     for (int kb = 0; kb < n_full_blocks; ++kb) {
         if (warp < ProducerWarps) {
-            const int row_base = warp * 16;
-            float score[QKNt][4];
+            const int row_base = (warp / ColSplit) * 16;
+            const int col_half = warp % ColSplit;
+            float score[QKNtL][4];
 #pragma unroll
-            for (int nt = 0; nt < QKNt; ++nt) {
+            for (int nt = 0; nt < QKNtL; ++nt) {
                 score[nt][0] = score[nt][1] = score[nt][2] = score[nt][3] = 0.0f;
             }
 
+// Full unroll interleaves all four groups' A-fragments and overflows the Ada register
+// file into local memory; two groups in flight keep the ntl chains independent spill-free.
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ == 890
+#pragma unroll 2
+#else
 #pragma unroll
+#endif
             for (int grp = 0; grp < Groups; ++grp) {
                 float qs0;
                 float qs1;
@@ -661,7 +714,8 @@ __global__ __maxnreg__(120) void gqa_attention_prefill_i8_kernel(
                 }
 
 #pragma unroll
-                for (int nt = 0; nt < QKNt; ++nt) {
+                for (int ntl = 0; ntl < QKNtL; ++ntl) {
+                    const int nt = col_half * QKNtL + ntl;
                     int c0 = 0, c1 = 0, c2 = 0, c3 = 0;
 #pragma unroll
                     for (int kk = 0; kk < GroupKc; ++kk) {
@@ -682,12 +736,12 @@ __global__ __maxnreg__(120) void gqa_attention_prefill_i8_kernel(
                         ks0 = __half2float(k_scale_s[keya * Groups + grp]);
                         ks1 = __half2float(k_scale_s[keyb * Groups + grp]);
                     }
-                    ks0          = __shfl_sync(FullMask, ks0, lid);
-                    ks1          = __shfl_sync(FullMask, ks1, lid);
-                    score[nt][0] = __fmaf_rn(qs0 * ks0, static_cast<float>(c0), score[nt][0]);
-                    score[nt][1] = __fmaf_rn(qs0 * ks1, static_cast<float>(c1), score[nt][1]);
-                    score[nt][2] = __fmaf_rn(qs1 * ks0, static_cast<float>(c2), score[nt][2]);
-                    score[nt][3] = __fmaf_rn(qs1 * ks1, static_cast<float>(c3), score[nt][3]);
+                    ks0           = __shfl_sync(FullMask, ks0, lid);
+                    ks1           = __shfl_sync(FullMask, ks1, lid);
+                    score[ntl][0] = __fmaf_rn(qs0 * ks0, static_cast<float>(c0), score[ntl][0]);
+                    score[ntl][1] = __fmaf_rn(qs0 * ks1, static_cast<float>(c1), score[ntl][1]);
+                    score[ntl][2] = __fmaf_rn(qs1 * ks0, static_cast<float>(c2), score[ntl][2]);
+                    score[ntl][3] = __fmaf_rn(qs1 * ks1, static_cast<float>(c3), score[ntl][3]);
                 }
             }
 
@@ -696,12 +750,21 @@ __global__ __maxnreg__(120) void gqa_attention_prefill_i8_kernel(
             float bm0                  = -CUDART_INF_F;
             float bm1                  = -CUDART_INF_F;
 #pragma unroll
-            for (int nt = 0; nt < QKNt; ++nt) {
-                bm0 = fmaxf(bm0, fmaxf(score[nt][0], score[nt][1]));
-                bm1 = fmaxf(bm1, fmaxf(score[nt][2], score[nt][3]));
+            for (int ntl = 0; ntl < QKNtL; ++ntl) {
+                bm0 = fmaxf(bm0, fmaxf(score[ntl][0], score[ntl][1]));
+                bm1 = fmaxf(bm1, fmaxf(score[ntl][2], score[ntl][3]));
             }
             bm0 = warp_max<4>(bm0, FullMask);
             bm1 = warp_max<4>(bm1, FullMask);
+            if constexpr (ColSplit == 2) {
+                if (lid == 0) {
+                    pair_m_s[col_half * Br + row0] = bm0;
+                    pair_m_s[col_half * Br + row1] = bm1;
+                }
+                asm volatile("bar.sync 1, %0;" ::"r"(ProducerWarps * 32) : "memory");
+                bm0 = fmaxf(pair_m_s[row0], pair_m_s[Br + row0]);
+                bm1 = fmaxf(pair_m_s[row1], pair_m_s[Br + row1]);
+            }
 
             const float nm0        = fmaxf(running_m0, bm0);
             const float nm1        = fmaxf(running_m1, bm1);
@@ -716,27 +779,31 @@ __global__ __maxnreg__(120) void gqa_attention_prefill_i8_kernel(
             float bl0              = 0.0f;
             float bl1              = 0.0f;
 #pragma unroll
-            for (int nt = 0; nt < QKNt; ++nt) {
-                const int col0  = nt * 8 + 2 * lid;
+            for (int ntl = 0; ntl < QKNtL; ++ntl) {
+                const int col0  = (col_half * QKNtL + ntl) * 8 + 2 * lid;
                 const int col1  = col0 + 1;
-                const float p00 = exp2_approx(__fmaf_rn(score[nt][0], scale_l2, -nm0_scaled));
-                const float p01 = exp2_approx(__fmaf_rn(score[nt][1], scale_l2, -nm0_scaled));
-                const float p10 = exp2_approx(__fmaf_rn(score[nt][2], scale_l2, -nm1_scaled));
-                const float p11 = exp2_approx(__fmaf_rn(score[nt][3], scale_l2, -nm1_scaled));
+                const float p00 = exp2_approx(__fmaf_rn(score[ntl][0], scale_l2, -nm0_scaled));
+                const float p01 = exp2_approx(__fmaf_rn(score[ntl][1], scale_l2, -nm0_scaled));
+                const float p10 = exp2_approx(__fmaf_rn(score[ntl][2], scale_l2, -nm1_scaled));
+                const float p11 = exp2_approx(__fmaf_rn(score[ntl][3], scale_l2, -nm1_scaled));
                 bl0 += p00 + p01;
                 bl1 += p10 + p11;
-                p_s[row0 * Bc + gqa_prefill_i8_p_swz(row0, col0)] = __float2half_rn(p00);
-                p_s[row0 * Bc + gqa_prefill_i8_p_swz(row0, col1)] = __float2half_rn(p01);
-                p_s[row1 * Bc + gqa_prefill_i8_p_swz(row1, col0)] = __float2half_rn(p10);
-                p_s[row1 * Bc + gqa_prefill_i8_p_swz(row1, col1)] = __float2half_rn(p11);
+                // The swizzle keeps even/odd column pairs adjacent, so store one half2.
+                *reinterpret_cast<__half2*>(&p_s[row0 * Bc + gqa_prefill_i8_p_swz(row0, col0)]) =
+                    __floats2half2_rn(p00, p01);
+                *reinterpret_cast<__half2*>(&p_s[row1 * Bc + gqa_prefill_i8_p_swz(row1, col0)]) =
+                    __floats2half2_rn(p10, p11);
             }
-            bl0        = warp_sum<4>(bl0, FullMask);
-            bl1        = warp_sum<4>(bl1, FullMask);
+            bl0 = warp_sum<4>(bl0, FullMask);
+            bl1 = warp_sum<4>(bl1, FullMask);
+            // With paired producers each half accumulates its own partial row sum; the
+            // shared block max makes the alpha sequences identical, so the halves add
+            // linearly and are combined once after the key loop.
             running_l0 = __fmaf_rn(running_l0, alpha0, bl0);
             running_l1 = __fmaf_rn(running_l1, alpha1, bl1);
             running_m0 = nm0;
             running_m1 = nm1;
-            if (lid == 0) {
+            if (col_half == 0 && lid == 0) {
                 alpha_s[row0] = alpha0;
                 alpha_s[row1] = alpha1;
             }
@@ -781,6 +848,14 @@ __global__ __maxnreg__(120) void gqa_attention_prefill_i8_kernel(
             }
         }
 
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ == 890
+        // Consumer Ada runs f32-acc HMMA at half rate. Accumulate the 64-key tile in
+        // packed fp16 at full rate and fold it into the fp32 running accumulator once
+        // per tile; the per-tile sums are magnitude-bounded by the softmax weights.
+        unsigned tacc[PVNtPerWarp][2];
+#pragma unroll
+        for (int n = 0; n < PVNtPerWarp; ++n) { tacc[n][0] = tacc[n][1] = 0u; }
+#endif
 #pragma unroll
         for (int k = 0; k < PVKs; ++k) {
             unsigned pf[4];
@@ -796,10 +871,25 @@ __global__ __maxnreg__(120) void gqa_attention_prefill_i8_kernel(
                 const int vcol = global_n * 8;
                 ldmatrix_x2_t(vf[0], vf[1],
                               smem_addr(&v_f16[vrow * D + gqa_prefill_swz(vrow, vcol)]));
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ == 890
+                mma_f16_f16acc(tacc[n][0], tacc[n][1], pf[0], pf[1], pf[2], pf[3], vf[0], vf[1]);
+#else
                 mma_f16(acc[n][0], acc[n][1], acc[n][2], acc[n][3], pf[0], pf[1], pf[2], pf[3],
                         vf[0], vf[1]);
+#endif
             }
         }
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ == 890
+#pragma unroll
+        for (int n = 0; n < PVNtPerWarp; ++n) {
+            const __half2 lo = *reinterpret_cast<const __half2*>(&tacc[n][0]);
+            const __half2 hi = *reinterpret_cast<const __half2*>(&tacc[n][1]);
+            acc[n][0] += __half2float(lo.x);
+            acc[n][1] += __half2float(lo.y);
+            acc[n][2] += __half2float(hi.x);
+            acc[n][3] += __half2float(hi.y);
+        }
+#endif
         if (has_next) { ninfer::ops::cp_wait<0>(); }
         __syncthreads();
     }
@@ -808,14 +898,21 @@ __global__ __maxnreg__(120) void gqa_attention_prefill_i8_kernel(
     for (int kb = n_full_blocks; kb < key_blocks; ++kb) {
         const int k0 = kb * Bc;
         if (warp < ProducerWarps) {
-            const int row_base = warp * 16;
-            float score[QKNt][4];
+            const int row_base = (warp / ColSplit) * 16;
+            const int col_half = warp % ColSplit;
+            float score[QKNtL][4];
 #pragma unroll
-            for (int nt = 0; nt < QKNt; ++nt) {
+            for (int nt = 0; nt < QKNtL; ++nt) {
                 score[nt][0] = score[nt][1] = score[nt][2] = score[nt][3] = 0.0f;
             }
 
+// Full unroll interleaves all four groups' A-fragments and overflows the Ada register
+// file into local memory; two groups in flight keep the ntl chains independent spill-free.
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ == 890
+#pragma unroll 2
+#else
 #pragma unroll
+#endif
             for (int grp = 0; grp < Groups; ++grp) {
                 float qs0;
                 float qs1;
@@ -842,7 +939,8 @@ __global__ __maxnreg__(120) void gqa_attention_prefill_i8_kernel(
                 }
 
 #pragma unroll
-                for (int nt = 0; nt < QKNt; ++nt) {
+                for (int ntl = 0; ntl < QKNtL; ++ntl) {
+                    const int nt = col_half * QKNtL + ntl;
                     int c0 = 0, c1 = 0, c2 = 0, c3 = 0;
 #pragma unroll
                     for (int kk = 0; kk < GroupKc; ++kk) {
@@ -863,12 +961,12 @@ __global__ __maxnreg__(120) void gqa_attention_prefill_i8_kernel(
                         ks0 = __half2float(k_scale_s[keya * Groups + grp]);
                         ks1 = __half2float(k_scale_s[keyb * Groups + grp]);
                     }
-                    ks0          = __shfl_sync(FullMask, ks0, lid);
-                    ks1          = __shfl_sync(FullMask, ks1, lid);
-                    score[nt][0] = __fmaf_rn(qs0 * ks0, static_cast<float>(c0), score[nt][0]);
-                    score[nt][1] = __fmaf_rn(qs0 * ks1, static_cast<float>(c1), score[nt][1]);
-                    score[nt][2] = __fmaf_rn(qs1 * ks0, static_cast<float>(c2), score[nt][2]);
-                    score[nt][3] = __fmaf_rn(qs1 * ks1, static_cast<float>(c3), score[nt][3]);
+                    ks0           = __shfl_sync(FullMask, ks0, lid);
+                    ks1           = __shfl_sync(FullMask, ks1, lid);
+                    score[ntl][0] = __fmaf_rn(qs0 * ks0, static_cast<float>(c0), score[ntl][0]);
+                    score[ntl][1] = __fmaf_rn(qs0 * ks1, static_cast<float>(c1), score[ntl][1]);
+                    score[ntl][2] = __fmaf_rn(qs1 * ks0, static_cast<float>(c2), score[ntl][2]);
+                    score[ntl][3] = __fmaf_rn(qs1 * ks1, static_cast<float>(c3), score[ntl][3]);
                 }
             }
 
@@ -880,20 +978,30 @@ __global__ __maxnreg__(120) void gqa_attention_prefill_i8_kernel(
             float bm0                  = -CUDART_INF_F;
             float bm1                  = -CUDART_INF_F;
 #pragma unroll
-            for (int nt = 0; nt < QKNt; ++nt) {
+            for (int ntl = 0; ntl < QKNtL; ++ntl) {
+                const int nt   = col_half * QKNtL + ntl;
                 const int key0 = k0 + nt * 8 + 2 * lid;
                 const int key1 = key0 + 1;
                 if (!full_score_tile) {
-                    score[nt][0] = key0 <= qabs0 ? score[nt][0] : -CUDART_INF_F;
-                    score[nt][1] = key1 <= qabs0 ? score[nt][1] : -CUDART_INF_F;
-                    score[nt][2] = key0 <= qabs1 ? score[nt][2] : -CUDART_INF_F;
-                    score[nt][3] = key1 <= qabs1 ? score[nt][3] : -CUDART_INF_F;
+                    score[ntl][0] = key0 <= qabs0 ? score[ntl][0] : -CUDART_INF_F;
+                    score[ntl][1] = key1 <= qabs0 ? score[ntl][1] : -CUDART_INF_F;
+                    score[ntl][2] = key0 <= qabs1 ? score[ntl][2] : -CUDART_INF_F;
+                    score[ntl][3] = key1 <= qabs1 ? score[ntl][3] : -CUDART_INF_F;
                 }
-                bm0 = fmaxf(bm0, fmaxf(score[nt][0], score[nt][1]));
-                bm1 = fmaxf(bm1, fmaxf(score[nt][2], score[nt][3]));
+                bm0 = fmaxf(bm0, fmaxf(score[ntl][0], score[ntl][1]));
+                bm1 = fmaxf(bm1, fmaxf(score[ntl][2], score[ntl][3]));
             }
             bm0 = warp_max<4>(bm0, FullMask);
             bm1 = warp_max<4>(bm1, FullMask);
+            if constexpr (ColSplit == 2) {
+                if (lid == 0) {
+                    pair_m_s[col_half * Br + row0] = bm0;
+                    pair_m_s[col_half * Br + row1] = bm1;
+                }
+                asm volatile("bar.sync 1, %0;" ::"r"(ProducerWarps * 32) : "memory");
+                bm0 = fmaxf(pair_m_s[row0], pair_m_s[Br + row0]);
+                bm1 = fmaxf(pair_m_s[row1], pair_m_s[Br + row1]);
+            }
 
             const float nm0        = fmaxf(running_m0, bm0);
             const float nm1        = fmaxf(running_m1, bm1);
@@ -908,35 +1016,39 @@ __global__ __maxnreg__(120) void gqa_attention_prefill_i8_kernel(
             float bl0              = 0.0f;
             float bl1              = 0.0f;
 #pragma unroll
-            for (int nt = 0; nt < QKNt; ++nt) {
-                const int col0  = nt * 8 + 2 * lid;
+            for (int ntl = 0; ntl < QKNtL; ++ntl) {
+                const int col0  = (col_half * QKNtL + ntl) * 8 + 2 * lid;
                 const int col1  = col0 + 1;
-                const float p00 = score[nt][0] > -CUDART_INF_F
-                                      ? exp2_approx(__fmaf_rn(score[nt][0], scale_l2, -nm0_scaled))
+                const float p00 = score[ntl][0] > -CUDART_INF_F
+                                      ? exp2_approx(__fmaf_rn(score[ntl][0], scale_l2, -nm0_scaled))
                                       : 0.0f;
-                const float p01 = score[nt][1] > -CUDART_INF_F
-                                      ? exp2_approx(__fmaf_rn(score[nt][1], scale_l2, -nm0_scaled))
+                const float p01 = score[ntl][1] > -CUDART_INF_F
+                                      ? exp2_approx(__fmaf_rn(score[ntl][1], scale_l2, -nm0_scaled))
                                       : 0.0f;
-                const float p10 = score[nt][2] > -CUDART_INF_F
-                                      ? exp2_approx(__fmaf_rn(score[nt][2], scale_l2, -nm1_scaled))
+                const float p10 = score[ntl][2] > -CUDART_INF_F
+                                      ? exp2_approx(__fmaf_rn(score[ntl][2], scale_l2, -nm1_scaled))
                                       : 0.0f;
-                const float p11 = score[nt][3] > -CUDART_INF_F
-                                      ? exp2_approx(__fmaf_rn(score[nt][3], scale_l2, -nm1_scaled))
+                const float p11 = score[ntl][3] > -CUDART_INF_F
+                                      ? exp2_approx(__fmaf_rn(score[ntl][3], scale_l2, -nm1_scaled))
                                       : 0.0f;
                 bl0 += p00 + p01;
                 bl1 += p10 + p11;
-                p_s[row0 * Bc + gqa_prefill_i8_p_swz(row0, col0)] = __float2half_rn(p00);
-                p_s[row0 * Bc + gqa_prefill_i8_p_swz(row0, col1)] = __float2half_rn(p01);
-                p_s[row1 * Bc + gqa_prefill_i8_p_swz(row1, col0)] = __float2half_rn(p10);
-                p_s[row1 * Bc + gqa_prefill_i8_p_swz(row1, col1)] = __float2half_rn(p11);
+                // The swizzle keeps even/odd column pairs adjacent, so store one half2.
+                *reinterpret_cast<__half2*>(&p_s[row0 * Bc + gqa_prefill_i8_p_swz(row0, col0)]) =
+                    __floats2half2_rn(p00, p01);
+                *reinterpret_cast<__half2*>(&p_s[row1 * Bc + gqa_prefill_i8_p_swz(row1, col0)]) =
+                    __floats2half2_rn(p10, p11);
             }
-            bl0        = warp_sum<4>(bl0, FullMask);
-            bl1        = warp_sum<4>(bl1, FullMask);
+            bl0 = warp_sum<4>(bl0, FullMask);
+            bl1 = warp_sum<4>(bl1, FullMask);
+            // With paired producers each half accumulates its own partial row sum; the
+            // shared block max makes the alpha sequences identical, so the halves add
+            // linearly and are combined once after the key loop.
             running_l0 = __fmaf_rn(running_l0, alpha0, bl0);
             running_l1 = __fmaf_rn(running_l1, alpha1, bl1);
             running_m0 = nm0;
             running_m1 = nm1;
-            if (lid == 0) {
+            if (col_half == 0 && lid == 0) {
                 alpha_s[row0] = alpha0;
                 alpha_s[row1] = alpha1;
             }
@@ -986,6 +1098,14 @@ __global__ __maxnreg__(120) void gqa_attention_prefill_i8_kernel(
             }
         }
 
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ == 890
+        // Consumer Ada runs f32-acc HMMA at half rate. Accumulate the 64-key tile in
+        // packed fp16 at full rate and fold it into the fp32 running accumulator once
+        // per tile; the per-tile sums are magnitude-bounded by the softmax weights.
+        unsigned tacc[PVNtPerWarp][2];
+#pragma unroll
+        for (int n = 0; n < PVNtPerWarp; ++n) { tacc[n][0] = tacc[n][1] = 0u; }
+#endif
 #pragma unroll
         for (int k = 0; k < PVKs; ++k) {
             unsigned pf[4];
@@ -1001,15 +1121,43 @@ __global__ __maxnreg__(120) void gqa_attention_prefill_i8_kernel(
                 const int vcol = global_n * 8;
                 ldmatrix_x2_t(vf[0], vf[1],
                               smem_addr(&v_f16[vrow * D + gqa_prefill_swz(vrow, vcol)]));
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ == 890
+                mma_f16_f16acc(tacc[n][0], tacc[n][1], pf[0], pf[1], pf[2], pf[3], vf[0], vf[1]);
+#else
                 mma_f16(acc[n][0], acc[n][1], acc[n][2], acc[n][3], pf[0], pf[1], pf[2], pf[3],
                         vf[0], vf[1]);
+#endif
             }
         }
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ == 890
+#pragma unroll
+        for (int n = 0; n < PVNtPerWarp; ++n) {
+            const __half2 lo = *reinterpret_cast<const __half2*>(&tacc[n][0]);
+            const __half2 hi = *reinterpret_cast<const __half2*>(&tacc[n][1]);
+            acc[n][0] += __half2float(lo.x);
+            acc[n][1] += __half2float(lo.y);
+            acc[n][2] += __half2float(hi.x);
+            acc[n][3] += __half2float(hi.y);
+        }
+#endif
         if (has_next) { ninfer::ops::cp_wait<0>(); }
         __syncthreads();
     }
 
-    if (warp < ProducerWarps && lid == 0) {
+    if constexpr (ColSplit == 2) {
+        if (warp < ProducerWarps && lid == 0) {
+            const int row0                            = (warp / ColSplit) * 16 + gid;
+            pair_l_s[(warp % ColSplit) * Br + row0]   = running_l0;
+            pair_l_s[(warp % ColSplit) * Br + row0 + 8] = running_l1;
+        }
+        __syncthreads();
+        if (warp < ProducerWarps && warp % ColSplit == 0 && lid == 0) {
+            const int row0  = (warp / ColSplit) * 16 + gid;
+            const int row1  = row0 + 8;
+            final_l_s[row0] = pair_l_s[row0] + pair_l_s[Br + row0];
+            final_l_s[row1] = pair_l_s[row1] + pair_l_s[Br + row1];
+        }
+    } else if (warp < ProducerWarps && lid == 0) {
         const int row0  = warp * 16 + gid;
         const int row1  = row0 + 8;
         final_l_s[row0] = running_l0;
