@@ -87,7 +87,7 @@ struct MediaInputPermit {
 namespace {
 
 using Clock                              = std::chrono::steady_clock;
-constexpr std::size_t kMaximumMediaItems = 16;
+constexpr std::size_t kMaximumMediaItems = 100;
 
 [[noreturn]] void throw_preparation_cancelled();
 
@@ -379,7 +379,7 @@ PreparedRequest GenerationService::prepare(const GenerationRequest& request,
     }
     if (media_items > kMaximumMediaItems) {
         throw_request_error(ninfer::RequestError(RequestErrorKind::MediaBudgetExceeded,
-                                                 "request exceeds the 16-item media limit"));
+                                                 "request exceeds the 100-item media limit"));
     }
     prepared.lifetime = acquire_request_lifetime();
     HostInputLease host_input;
@@ -419,7 +419,7 @@ int GenerationService::count_prompt_tokens(const GenerationRequest& request,
     }
     if (media_items > kMaximumMediaItems) {
         throw_request_error(ninfer::RequestError(RequestErrorKind::MediaBudgetExceeded,
-                                                 "request exceeds the 16-item media limit"));
+                                                 "request exceeds the 100-item media limit"));
     }
     const Clock::time_point deadline =
         Clock::now() + std::chrono::milliseconds(options_.pending_timeout_ms);
