@@ -6,10 +6,14 @@ function(ninfer_internal_includes target)
     ${PROJECT_SOURCE_DIR}/third_party/utf8proc)
 endfunction()
 
+# Every device symbol in this project is defined and consumed inside a single translation
+# unit: there is no `extern __device__`/`extern __constant__`, no cross-TU `__global__`
+# declaration, no device function pointer, and no dynamic parallelism (`pdl.cuh` compiles to
+# an ordinary host launch on sm_86/sm_89). Relocatable device code is therefore pure cost --
+# it forces ptxas to assume external linkage, which turns dynamic-lane `__shfl_sync` into an
+# out-of-line ABI call (stack frame + spills) and disables software pipelining of global
+# loads across loop back edges. Compiling whole-program keeps ptxas free to optimize.
 function(ninfer_cuda_archive target)
-  set_target_properties(${target} PROPERTIES
-    CUDA_SEPARABLE_COMPILATION ON
-    CUDA_RESOLVE_DEVICE_SYMBOLS ON)
   if(WIN32)
     set_target_properties(${target} PROPERTIES CUDA_RUNTIME_LIBRARY Static)
   endif()
@@ -125,6 +129,7 @@ add_library(ninfer_ops STATIC
   ops/linear/q4/q4_rowsplit_gemv.cu
   ops/linear/q4/q4_dispatch.cpp
   ops/linear/q5/q5_dispatch.cpp
+  ops/linear/q5/q5_small_t_mma.cu
   ops/linear/q5/q5_rowsplit_gemm_mma.cu
   ops/linear/q5/q5_rowsplit_gemm_simt.cu
   ops/linear/q5/q5_rowsplit_gemv.cu
@@ -271,7 +276,8 @@ target_link_libraries(ninfer_engine
     ninfer_core
     ninfer_ops
     ninfer_text
-    ninfer_media_decode)
+    ninfer_media_decode
+    ninfer_xgrammar)
 add_library(ninfer::engine ALIAS ninfer_engine)
 
 if(NINFER_BUILD_SERVE)

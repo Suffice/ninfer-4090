@@ -162,7 +162,8 @@ public:
         std::shared_ptr<Request> request;
         try {
             auto output = instance_.loaded->frontend.make_output_session(prompt, options.stop,
-                                                                         options.output);
+                                                                         options.output,
+                                                                         options.structured_output);
             request = std::make_shared<Request>(request_id, std::move(prompt), std::move(output),
                                                 prompt_summary, prepare_seconds, std::move(options),
                                                 pending_deadline, submitted, std::move(host_input));
@@ -182,6 +183,13 @@ public:
         }
         queue_cv_.notify_one();
         return Submission(*this, std::move(request));
+    }
+
+    // False once the worker loop has torn the executor down (`fail_all`) or shutdown has begun.
+    // Latched failures are permanent, so /health can report the process as unserviceable.
+    [[nodiscard]] bool healthy() const {
+        std::lock_guard lock(queue_mutex_);
+        return !stopping_ && !failed_;
     }
 
     [[nodiscard]] MemorySummary memory_summary() const {
@@ -514,10 +522,20 @@ private:
             complete_success(request, decision.finish_reason);
             return true;
         }
+        if (request->output.has_token_constraint()) {
+            instance_.program->set_token_mask_lane(lane, request->output.next_token_bitmask());
+        }
         return false;
     }
 
     void invalidate_lane_plans(std::uint32_t lane) noexcept { ++lane_plan_versions_[lane]; }
+
+    [[nodiscard]] bool any_lane_active_except(std::uint32_t lane) const noexcept {
+        for (std::uint32_t other = 0; other < max_concurrency_; ++other) {
+            if (other != lane && slots_[other] != nullptr) { return true; }
+        }
+        return false;
+    }
 
     void remove_completed_slot(std::uint32_t lane) {
         slots_[lane].reset();
@@ -701,6 +719,10 @@ private:
 
     void ensure_base_plan(const std::shared_ptr<Request>& request) {
         if (!request->base_plan) {
+            if (request->output.has_token_constraint()) {
+                const auto mask = request->output.next_token_bitmask();
+                request->options.execution.token_mask.assign(mask.begin(), mask.end());
+            }
             request->base_plan.emplace(
                 instance_.program->plan_request_base(request->prompt, request->options.execution));
         }
@@ -811,7 +833,23 @@ private:
                 }
             }
             if (!instance_.program->can_admit_lane(lane, *request->lane_plans[lane])) {
-                throw std::logic_error("retained eviction did not make admission feasible");
+                // The lane plan was built against an earlier view of the page pool: concurrent
+                // checkpoint restores and snapshot saves can consume pages between planning and
+                // admission. Evicting every free retained lane was not enough, which is a
+                // scheduling shortfall rather than a broken engine, so drop the stale plan
+                // instead of throwing (an escaped exception here fails the whole executor).
+                invalidate_lane_plans(lane);
+                if (!any_lane_active_except(lane)) {
+                    // No other lane holds pages, so waiting cannot free any more: this request
+                    // does not fit the configured KV capacity at all.
+                    return remove_pending_error(
+                        request, std::make_exception_ptr(RequestError(
+                                     RequestErrorKind::ContextLengthExceeded,
+                                     "request reservation exceeds Engine shared KV capacity")));
+                }
+                // Active lanes still hold the pages we need. Leave the request pending and retry
+                // once they drain; its pending deadline bounds the wait.
+                return AdmissionProgress::ControlProgress;
             }
         }
 
@@ -1058,8 +1096,7 @@ private:
             }
             const OutputDecision decision = request->output.preview(
                 row_tokens, request->budget->remaining(), request->budget->limit_reason());
-            if (decision.accepted_tokens == 0 || decision.accepted_tokens > count ||
-                (!decision.finished() && decision.accepted_tokens != count)) {
+            if (decision.accepted_tokens == 0 || decision.accepted_tokens > count) {
                 throw std::logic_error("output policy returned an invalid licensed prefix");
             }
             accepted[row]       = decision.accepted_tokens;
@@ -1091,6 +1128,9 @@ private:
             if (terminal[row]) {
                 complete_success(request, finish_reasons[row]);
                 remove_completed_slot(lane);
+            } else if (request->output.has_token_constraint()) {
+                instance_.program->set_token_mask_lane(lane,
+                                                       request->output.next_token_bitmask());
             }
         }
         ++cumulative_stats_.decode_rounds;

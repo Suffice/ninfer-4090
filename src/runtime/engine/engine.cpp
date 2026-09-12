@@ -23,6 +23,7 @@ runtime::ResolvedRequestOptions resolve_request_options(const ModelSamplingDefau
     resolved.execution.allow_prefix_reuse      = options.execution.allow_prefix_reuse;
     resolved.stop                              = std::move(options.stop);
     resolved.output                            = options.output;
+    resolved.structured_output                 = std::move(options.structured_output);
     return resolved;
 }
 
@@ -331,6 +332,20 @@ RuntimeStats Engine::runtime_stats() const {
                 throw std::logic_error("concurrent Engine executor is unavailable");
             } else {
                 return executor->runtime_stats();
+            }
+        },
+        impl_->executor);
+}
+
+bool Engine::healthy() const {
+    if (impl_ == nullptr) { return false; }
+    return std::visit(
+        [](const auto& executor) -> bool {
+            using Executor = std::remove_cvref_t<decltype(executor)>;
+            if constexpr (std::is_same_v<Executor, std::monostate>) {
+                return false;
+            } else {
+                return executor->healthy();
             }
         },
         impl_->executor);
