@@ -1797,6 +1797,10 @@ struct Response {
                         const std::string &content_type);
   void set_file_content(const std::string &path);
 
+  void hold_resource(std::shared_ptr<void> resource) {
+    resource_guard_ = std::move(resource);
+  }
+
   Response() = default;
   Response(const Response &) = default;
   Response &operator=(const Response &) = default;
@@ -1814,6 +1818,7 @@ struct Response {
   ContentProviderResourceReleaser content_provider_resource_releaser_;
   bool is_chunked_content_provider_ = false;
   bool content_provider_success_ = false;
+  std::shared_ptr<void> resource_guard_;
   std::string file_content_path_;
   std::string file_content_content_type_;
 

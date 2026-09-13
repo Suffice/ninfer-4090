@@ -84,7 +84,7 @@ Json parse_json_body(const httplib::Request& request) {
 }
 
 bool disconnected(const httplib::Request& request) {
-    return request.is_connection_alive && !request.is_connection_alive();
+    return request.is_connection_closed ? request.is_connection_closed() : false;
 }
 
 void write_stream_item(httplib::DataSink& sink, StreamingResponse& request,

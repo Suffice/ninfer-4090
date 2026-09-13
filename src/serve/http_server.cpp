@@ -474,7 +474,7 @@ void HttpServer::handle_chat_completions(const httplib::Request& req, httplib::R
             request.model = public_model_id_;
         }
         prepared = service_->prepare(
-            request, [&req] { return req.is_connection_alive && !req.is_connection_alive(); });
+            request, [&req] { return req.is_connection_closed ? req.is_connection_closed() : false; });
     } catch (const ApiException& e) {
         write_error(res, e.error());
         return;
@@ -492,7 +492,7 @@ void HttpServer::handle_chat_completions(const httplib::Request& req, httplib::R
     if (!request.stream) {
         try {
             const GenerationOutcome outcome = service_->run(prepared, nullptr, [&req] {
-                return req.is_connection_alive && !req.is_connection_alive();
+                return req.is_connection_closed ? req.is_connection_closed() : false;
             });
             log_request_done(log_context, outcome);
             const CompletionUsage usage     = make_completion_usage(outcome);
@@ -678,7 +678,7 @@ void HttpServer::handle_count_tokens(const httplib::Request& req, httplib::Respo
         limits.default_max_tokens       = options_.default_max_tokens;
         const GenerationRequest request = parse_messages_request(body, limits);
         const int input_tokens          = service_->count_prompt_tokens(
-            request, [&req] { return req.is_connection_alive && !req.is_connection_alive(); });
+            request, [&req] { return req.is_connection_closed ? req.is_connection_closed() : false; });
         res.set_content(make_count_tokens_response(input_tokens), "application/json");
     } catch (const ApiException& e) {
         write_messages_error(res, e.error());
@@ -712,7 +712,7 @@ void HttpServer::handle_messages(const httplib::Request& req, httplib::Response&
         // Claude model names) and echoes it back; it never 404s on model id.
         request  = parse_messages_request(body, limits);
         prepared = service_->prepare(
-            request, [&req] { return req.is_connection_alive && !req.is_connection_alive(); });
+            request, [&req] { return req.is_connection_closed ? req.is_connection_closed() : false; });
     } catch (const ApiException& e) {
         write_messages_error(res, e.error());
         return;
@@ -737,7 +737,7 @@ void HttpServer::handle_messages(const httplib::Request& req, httplib::Response&
     if (!request.stream) {
         try {
             const GenerationOutcome outcome = service_->run(prepared, nullptr, [&req] {
-                return req.is_connection_alive && !req.is_connection_alive();
+                return req.is_connection_closed ? req.is_connection_closed() : false;
             });
             log_request_done(log_context, outcome);
             const CompletionUsage usage{outcome.prompt_tokens, outcome.completion_tokens};
