@@ -152,7 +152,7 @@ void gdn_norm_gating_proj(const Tensor& x, const Tensor& norm_weight, float eps,
     }
     require_sequence_tensor(x, DType::BF16, 2048, tokens, op, "x");
     require_vector_tensor(norm_weight, DType::BF16, 2048, op, "norm_weight");
-    require_sequence_tensor(h, DType::BF16, 2048, op, "h");
+    require_sequence_tensor(h, DType::BF16, 2048, tokens, op, "h");
     require_vector_tensor(A_log, DType::FP32, 32, op, "A_log");
     require_vector_tensor(dt_bias, DType::FP32, 32, op, "dt_bias");
     require_sequence_tensor(g, DType::FP32, 32, tokens, op, "g");
