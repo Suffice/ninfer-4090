@@ -127,6 +127,7 @@ FrontendResources resources(const std::string& chat_template = thinking_toggle_t
          added(248045, "<|im_start|>", true), added(248046, "<|im_end|>", true),
          added(248053, "<|vision_start|>", true), added(248054, "<|vision_end|>", true),
          added(248056, "<|image_pad|>", true), added(248057, "<|video_pad|>", true),
+         added(248058, "[image omitted]", true), added(248059, "[video omitted]", true),
          added(248068, "<think>"), added(248069, "</think>")});
     nlohmann::json vocab           = {{"x", 0}, {"ä", 10}, {"¸", 11}, {"Ń", 12}};
     vocab[byte_level_symbol(0x80)] = kByte80Token;
@@ -1088,6 +1089,73 @@ int test_high_resolution_image_resizing_and_budget() {
     return failures;
 }
 
+int test_oldest_media_purging() {
+    int failures = 0;
+    const FrontendResources owned = resources();
+    // vmt=16 ⇒ raw patch cap 64; each 64x64 test image probes to a 4x4 grid (16 raw
+    // patches, 4 vision tokens), so at most 4 images fit and the older ones purge.
+    const Frontend frontend = FrontendFactory::create_component(owned, true, 16);
+
+    auto image_part = [] {
+        ninfer::MessagePart part;
+        part.kind              = ninfer::MessagePartKind::Media;
+        part.media.kind        = ninfer::MediaKind::Image;
+        part.media.bytes       = gradient_ppm();
+        part.media.media_type  = "image/x-portable-pixmap";
+        part.media.source_name = "gradient.ppm";
+        return part;
+    };
+
+    auto make_input = [&image_part](int count) {
+        ninfer::PromptInput input;
+        for (int i = 0; i < count; ++i) {
+            ninfer::ChatMessage message;
+            message.role = "user";
+            message.parts.push_back(image_part());
+            input.messages.push_back(std::move(message));
+        }
+        return input;
+    };
+
+    auto count_token = [](const PreparedPrompt& prepared, int id) {
+        std::size_t count = 0;
+        for (const int token : FrontendFactory::inspect(prepared).token_ids) {
+            if (token == id) { ++count; }
+        }
+        return count;
+    };
+
+    {
+        PreparedPrompt prepared = frontend.prepare(make_input(7));
+        const auto& data        = FrontendFactory::inspect(prepared);
+        failures += check(data.prepare.media_items == 4, "7 images: expected 4 survivors");
+        failures += check(data.prepare.media_items_purged == 3, "7 images: expected 3 purged");
+        failures += check(data.vision_items.size() == 4, "7 images: expected 4 vision items");
+        failures += check(data.prepare.raw_patches == 64, "7 images: raw patches should reach cap");
+        failures += check(data.patches.size() == 4 * 16 * 1536,
+                          "7 images: patch buffer size mismatch");
+        failures += check(data.vision_items[0].content_digest == kGradientDigest,
+                          "7 images: survivor digest mismatch");
+        failures += check(count_token(prepared, 248056) == 16,
+                          "7 images: expected 16 image pad tokens");
+        failures += check(count_token(prepared, 248058) == 3,
+                          "7 images: expected 3 image-omitted markers");
+        failures += check(count_token(prepared, 248059) == 0,
+                          "7 images: unexpected video-omitted markers");
+    }
+    {
+        PreparedPrompt prepared = frontend.prepare(make_input(101));
+        const auto& data        = FrontendFactory::inspect(prepared);
+        failures += check(data.prepare.media_items == 4, "101 images: expected 4 survivors");
+        failures += check(data.prepare.media_items_purged == 97,
+                          "101 images: expected 97 purged (1 count + 96 budget)");
+        failures += check(data.vision_items.size() == 4, "101 images: expected 4 vision items");
+        failures += check(count_token(prepared, 248058) == 97,
+                          "101 images: expected 97 image-omitted markers");
+    }
+    return failures;
+}
+
 } // namespace
 
 int main() {
@@ -1103,6 +1171,7 @@ int main() {
         failures += test_official_resource_guards();
         failures += test_text_and_image_prepare(frontend);
         failures += test_high_resolution_image_resizing_and_budget();
+        failures += test_oldest_media_purging();
         failures += test_video_prepare(frontend);
         failures += test_cross_round_stop(frontend);
         failures += test_same_token_stop_priority(frontend);

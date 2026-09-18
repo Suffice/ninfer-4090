@@ -62,12 +62,13 @@ struct VisionItem {
 };
 
 struct PreprocessStats {
-    std::size_t media_items       = 0;
-    std::uint64_t raw_patches     = 0;
-    std::uint64_t vision_tokens   = 0;
-    std::uint64_t attention_pairs = 0;
-    std::size_t prompt_tokens     = 0;
-    std::size_t patch_bytes       = 0;
+    std::size_t media_items        = 0;
+    std::size_t media_items_purged = 0;
+    std::uint64_t raw_patches      = 0;
+    std::uint64_t vision_tokens    = 0;
+    std::uint64_t attention_pairs  = 0;
+    std::size_t prompt_tokens      = 0;
+    std::size_t patch_bytes        = 0;
 
     [[nodiscard]] std::string summary() const;
 };
@@ -90,6 +91,10 @@ struct ProcessorOptions {
     double video_fps                       = 2.0;
     int video_min_frames                   = 4;
     int video_max_frames                   = 768;
+    // When the media budget is exceeded, drop the oldest media items (replacing their
+    // placeholders with a short text marker) until the remaining items fit, instead of
+    // failing the whole request with a budget error.
+    bool purge_oldest_media = true;
 };
 
 struct ProcessedInput {

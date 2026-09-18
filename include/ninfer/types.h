@@ -319,6 +319,9 @@ private:
 struct PromptSummary {
     std::uint32_t prompt_tokens = 0;
     bool has_media              = false;
+    // Oldest media items dropped by the processor budget (purge_oldest_media) before
+    // this prompt was prepared; their placeholders became short text markers.
+    std::uint32_t media_items_purged = 0;
 };
 
 enum class FinishReason : std::uint8_t {

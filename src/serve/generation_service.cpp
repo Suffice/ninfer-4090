@@ -87,7 +87,7 @@ struct MediaInputPermit {
 namespace {
 
 using Clock                              = std::chrono::steady_clock;
-constexpr std::size_t kMaximumMediaItems = 100;
+constexpr std::size_t kMaximumMediaItems = 4096;
 
 [[noreturn]] void throw_preparation_cancelled();
 
@@ -379,7 +379,9 @@ PreparedRequest GenerationService::prepare(const GenerationRequest& request,
     }
     if (media_items > kMaximumMediaItems) {
         throw_request_error(ninfer::RequestError(RequestErrorKind::MediaBudgetExceeded,
-                                                 "request exceeds the 100-item media limit"));
+                                                 "request exceeds the " +
+                                                     std::to_string(kMaximumMediaItems) +
+                                                     "-item media limit"));
     }
     prepared.lifetime = acquire_request_lifetime();
     HostInputLease host_input;
@@ -398,6 +400,12 @@ PreparedRequest GenerationService::prepare(const GenerationRequest& request,
         ninfer::PreparedPrompt prompt = engine_->prepare(std::move(input));
         check_preparation_control(prepared.lifetime->deadline, is_cancelled);
         prepared.prompt_tokens = static_cast<int>(prompt.summary().prompt_tokens);
+        if (prompt.summary().media_items_purged > 0) {
+            write_console_log(
+                ConsoleLogLevel::Info,
+                "vision budget: purged " + std::to_string(prompt.summary().media_items_purged) +
+                    " oldest media item(s) to fit the processor budget");
+        }
         prepared.prepare_seconds =
             std::chrono::duration<double>(Clock::now() - prepared.lifetime->started).count();
         prepared.generation = engine_->submit(std::move(prompt), std::move(request_options),
@@ -419,7 +427,9 @@ int GenerationService::count_prompt_tokens(const GenerationRequest& request,
     }
     if (media_items > kMaximumMediaItems) {
         throw_request_error(ninfer::RequestError(RequestErrorKind::MediaBudgetExceeded,
-                                                 "request exceeds the 100-item media limit"));
+                                                 "request exceeds the " +
+                                                     std::to_string(kMaximumMediaItems) +
+                                                     "-item media limit"));
     }
     const Clock::time_point deadline =
         Clock::now() + std::chrono::milliseconds(options_.pending_timeout_ms);

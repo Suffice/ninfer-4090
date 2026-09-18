@@ -714,8 +714,9 @@ PreparedPrompt& PreparedPrompt::operator=(PreparedPrompt&&) noexcept = default;
 
 PromptSummary PreparedPrompt::summary() const {
     if (data_ == nullptr) { throw std::logic_error("prepared prompt is empty"); }
-    return PromptSummary{.prompt_tokens = checked_token_count(data_->token_ids.size()),
-                         .has_media     = data_->has_media()};
+    return PromptSummary{.prompt_tokens      = checked_token_count(data_->token_ids.size()),
+                         .has_media          = data_->has_media(),
+                         .media_items_purged = static_cast<std::uint32_t>(data_->prepare.media_items_purged)};
 }
 
 double PreparedPrompt::prepare_seconds() const noexcept {
@@ -971,6 +972,7 @@ PreparedPrompt Frontend::prepare(PromptInput input) const {
             result.vision_items.push_back(convert_vision_item(std::move(item)));
         }
         result.prepare.media_items            = processed.stats.media_items;
+        result.prepare.media_items_purged     = processed.stats.media_items_purged;
         result.prepare.raw_patches            = processed.stats.raw_patches;
         result.prepare.vision_tokens          = processed.stats.vision_tokens;
         result.prepare.attention_pairs        = processed.stats.attention_pairs;

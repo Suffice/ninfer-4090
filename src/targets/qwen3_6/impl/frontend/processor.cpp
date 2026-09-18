@@ -24,6 +24,9 @@ namespace {
 constexpr int kPatchFeatures            = 3 * kTemporal * kPatch * kPatch;
 constexpr int kImageToken               = 248056;
 constexpr int kVideoToken               = 248057;
+// Text substituted for the placeholder of a media item purged from the processor budget.
+constexpr std::string_view kImageOmitted = "[image omitted]";
+constexpr std::string_view kVideoOmitted = "[video omitted]";
 constexpr std::string_view kImagePad    = "<|image_pad|>";
 constexpr std::string_view kVideoPad    = "<|video_pad|>";
 constexpr std::string_view kVisionStart = "<|vision_start|>";
@@ -34,10 +37,7 @@ struct Size {
     int w = 0;
 };
 
-struct Prepared {
-    VisionItem item;
-    std::vector<float> patches;
-};
+int round_even(double value) { return static_cast<int>(std::nearbyint(value)); }
 
 std::uint64_t checked_mul(std::uint64_t a, std::uint64_t b, std::string_view label) {
     if (a != 0 && b > std::numeric_limits<std::uint64_t>::max() / a) {
@@ -45,8 +45,6 @@ std::uint64_t checked_mul(std::uint64_t a, std::uint64_t b, std::string_view lab
     }
     return a * b;
 }
-
-int round_even(double value) { return static_cast<int>(std::nearbyint(value)); }
 
 Size smart_resize_image(int height, int width, std::uint64_t min_pixels, std::uint64_t max_pixels) {
     if (height <= 0 || width <= 0 || min_pixels == 0 || max_pixels < min_pixels) {
@@ -219,64 +217,91 @@ void append_patch(const std::vector<const media::decode::Image*>& frames, int gr
 void add_budget(PreprocessStats& stats, const VisionItem& item);
 void enforce_budget(const PreprocessStats& stats, const ProcessorOptions& options);
 
-Prepared prepare_image(const ChatPart& part, const ProcessorOptions& options,
-                       const media::decode::Policy& policy, PreprocessStats& stats) {
+VisionItem probe_image(const ChatPart& part, const ProcessorOptions& options,
+                       const media::decode::Policy& policy) {
     media::decode::Image image = media::decode::decode_image(part.media.bytes, policy);
     const Size size = smart_resize_image(image.height, image.width, options.image_min_pixels,
                                          options.image_max_pixels);
-    const int gh    = size.h / kPatch;
-    const int gw    = size.w / kPatch;
-    Prepared out;
-    out.item.modality = Modality::Image;
-    out.item.grid     = {1, gh, gw};
-    add_budget(stats, out.item);
-    enforce_budget(stats, options);
+    VisionItem item;
+    item.modality = Modality::Image;
+    item.grid     = {1, size.h / kPatch, size.w / kPatch};
+    return item;
+}
+
+std::vector<float> materialize_image(const ChatPart& part, const VisionItem& item,
+                                     const ProcessorOptions& options,
+                                     const media::decode::Policy& policy) {
+    media::decode::Image image = media::decode::decode_image(part.media.bytes, policy);
+    const Size size = smart_resize_image(image.height, image.width, options.image_min_pixels,
+                                         options.image_max_pixels);
+    if (item.grid.h != size.h / kPatch || item.grid.w != size.w / kPatch) {
+        throw std::logic_error("vision grid changed between probe and materialize");
+    }
+    const int gh = size.h / kPatch;
+    const int gw = size.w / kPatch;
     image = resize_bicubic(image, size);
-    out.patches.reserve(static_cast<std::size_t>(gh) * gw * kPatchFeatures);
+    std::vector<float> patches;
+    patches.reserve(static_cast<std::size_t>(gh) * gw * kPatchFeatures);
     const std::vector<const media::decode::Image*> frames{&image, &image};
     for (int block_y = 0; block_y < gh / kMerge; ++block_y) {
         for (int block_x = 0; block_x < gw / kMerge; ++block_x) {
             for (int merge_y = 0; merge_y < kMerge; ++merge_y) {
                 for (int merge_x = 0; merge_x < kMerge; ++merge_x) {
                     append_patch(frames, block_y * kMerge + merge_y, block_x * kMerge + merge_x,
-                                 out.patches);
+                                 patches);
                 }
             }
         }
     }
-    return out;
+    return patches;
 }
 
-Prepared prepare_video(const ChatPart& part, const ProcessorOptions& options,
-                       const media::decode::Policy& policy, PreprocessStats& stats) {
+VisionItem probe_video(const ChatPart& part, const ProcessorOptions& options,
+                       const media::decode::Policy& policy) {
     media::decode::Video video =
         media::decode::decode_video(part.media.bytes, policy, options.video_fps,
                                     options.video_min_frames, options.video_max_frames);
     const Size size =
         smart_resize_video(static_cast<int>(video.frames.size()), video.height, video.width,
                            options.video_min_pixels, options.video_max_pixels);
-    const bool pad_temporal = video.frames.size() % kTemporal != 0;
-    const int gt            = static_cast<int>((video.frames.size() + kTemporal - 1) / kTemporal);
-    const int gh            = size.h / kPatch;
-    const int gw            = size.w / kPatch;
-    Prepared out;
-    out.item.modality = Modality::Video;
-    out.item.grid     = {gt, gh, gw};
-    add_budget(stats, out.item);
-    enforce_budget(stats, options);
-    for (media::decode::Image& frame : video.frames) { frame = resize_bicubic(frame, size); }
-    if (pad_temporal) { video.frames.push_back(video.frames.back()); }
-    out.item.timestamps.reserve(static_cast<std::size_t>(gt));
+    const int gt = static_cast<int>((video.frames.size() + kTemporal - 1) / kTemporal);
+    VisionItem item;
+    item.modality = Modality::Video;
+    item.grid     = {gt, size.h / kPatch, size.w / kPatch};
+    item.timestamps.reserve(static_cast<std::size_t>(gt));
     std::vector<int> timestamp_indices = video.indices;
     if (timestamp_indices.size() % kTemporal != 0) {
         timestamp_indices.push_back(timestamp_indices.back());
     }
     for (int t = 0; t < gt; ++t) {
-        out.item.timestamps.push_back(
+        item.timestamps.push_back(
             static_cast<double>(timestamp_indices[2 * t] + timestamp_indices[2 * t + 1]) /
             (2.0 * video.fps));
     }
-    out.patches.reserve(static_cast<std::size_t>(gt) * gh * gw * kPatchFeatures);
+    return item;
+}
+
+std::vector<float> materialize_video(const ChatPart& part, const VisionItem& item,
+                                     const ProcessorOptions& options,
+                                     const media::decode::Policy& policy) {
+    media::decode::Video video =
+        media::decode::decode_video(part.media.bytes, policy, options.video_fps,
+                                    options.video_min_frames, options.video_max_frames);
+    const Size size =
+        smart_resize_video(static_cast<int>(video.frames.size()), video.height, video.width,
+                           options.video_min_pixels, options.video_max_pixels);
+    const int gt = item.grid.t;
+    if (item.grid.h != size.h / kPatch || item.grid.w != size.w / kPatch ||
+        gt != static_cast<int>((video.frames.size() + kTemporal - 1) / kTemporal) ||
+        item.timestamps.size() != static_cast<std::size_t>(gt)) {
+        throw std::logic_error("vision grid changed between probe and materialize");
+    }
+    const int gh = size.h / kPatch;
+    const int gw = size.w / kPatch;
+    for (media::decode::Image& frame : video.frames) { frame = resize_bicubic(frame, size); }
+    if (video.frames.size() % kTemporal != 0) { video.frames.push_back(video.frames.back()); }
+    std::vector<float> patches;
+    patches.reserve(static_cast<std::size_t>(gt) * gh * gw * kPatchFeatures);
     for (int t = 0; t < gt; ++t) {
         const std::vector<const media::decode::Image*> frames{
             &video.frames[static_cast<std::size_t>(2 * t)],
@@ -286,13 +311,13 @@ Prepared prepare_video(const ChatPart& part, const ProcessorOptions& options,
                 for (int merge_y = 0; merge_y < kMerge; ++merge_y) {
                     for (int merge_x = 0; merge_x < kMerge; ++merge_x) {
                         append_patch(frames, block_y * kMerge + merge_y, block_x * kMerge + merge_x,
-                                     out.patches);
+                                     patches);
                     }
                 }
             }
         }
     }
-    return out;
+    return patches;
 }
 
 std::vector<const ChatPart*> media_parts(const std::vector<ChatMessage>& messages) {
@@ -343,18 +368,30 @@ std::string placeholder(const VisionItem& item) {
     return out;
 }
 
-RenderedChat expand_placeholders(RenderedChat rendered, const std::vector<VisionItem>& items) {
+// One rendered placeholder slot: either a surviving media item (expanded to pad tokens) or a
+// purged item (replaced by a short text marker).
+struct PlaceholderEntry {
+    VisionItem item;
+    bool removed = false;
+};
+
+RenderedChat expand_placeholders(RenderedChat rendered,
+                                 const std::vector<PlaceholderEntry>& entries) {
     std::size_t search = 0;
-    for (const VisionItem& item : items) {
-        const std::string_view needle    = item.modality == Modality::Image ? kImagePad : kVideoPad;
+    for (const PlaceholderEntry& entry : entries) {
+        const Modality modality = entry.item.modality;
+        const std::string_view needle    = modality == Modality::Image ? kImagePad : kVideoPad;
         const std::size_t position       = rendered.text.find(needle, search);
-        const std::string_view other     = item.modality == Modality::Image ? kVideoPad : kImagePad;
+        const std::string_view other     = modality == Modality::Image ? kVideoPad : kImagePad;
         const std::size_t other_position = rendered.text.find(other, search);
         if (position == std::string::npos ||
             (other_position != std::string::npos && other_position < position)) {
             throw std::invalid_argument("chat media order does not match rendered placeholders");
         }
-        const std::string replacement = placeholder(item);
+        const std::string replacement =
+            entry.removed
+                ? std::string(modality == Modality::Image ? kImageOmitted : kVideoOmitted)
+                : placeholder(entry.item);
         if (rendered.turn_rewrite_byte_offset) {
             const std::size_t boundary = *rendered.turn_rewrite_byte_offset;
             const std::size_t end      = position + needle.size();
@@ -385,6 +422,16 @@ void add_budget(PreprocessStats& stats, const VisionItem& item) {
     stats.attention_pairs += checked_mul(static_cast<std::uint64_t>(item.grid.t),
                                          checked_mul(spatial, spatial, "vision attention pairs"),
                                          "vision attention pairs");
+}
+
+// Exact inverse of add_budget; only valid for items that were added without overflow.
+void subtract_budget(PreprocessStats& stats, const VisionItem& item) {
+    const std::uint64_t spatial =
+        static_cast<std::uint64_t>(item.grid.h) * static_cast<std::uint64_t>(item.grid.w);
+    const std::uint64_t patches = static_cast<std::uint64_t>(item.grid.t) * spatial;
+    stats.raw_patches -= patches;
+    stats.vision_tokens -= patches / (kMerge * kMerge);
+    stats.attention_pairs -= static_cast<std::uint64_t>(item.grid.t) * spatial * spatial;
 }
 
 void enforce_budget(const PreprocessStats& stats, const ProcessorOptions& options) {
@@ -504,7 +551,8 @@ void validate_special_token(const Tokenizer& tokenizer, std::string_view text, i
 
 std::string PreprocessStats::summary() const {
     std::ostringstream out;
-    out << "media=" << media_items << " patches=" << raw_patches
+    out << "media=" << media_items << " purged=" << media_items_purged
+        << " patches=" << raw_patches
         << " vision_tokens=" << vision_tokens << " attention_pairs=" << attention_pairs
         << " prompt_tokens=" << prompt_tokens << " patch_bytes=" << patch_bytes;
     return out.str();
@@ -558,7 +606,8 @@ Processor::Processor(const Tokenizer& tokenizer, const CompiledChatTemplate& cha
 ProcessedInput Processor::process(const std::vector<ChatMessage>& messages,
                                   ChatRenderOptions render_options) const {
     const std::vector<const ChatPart*> parts = media_parts(messages);
-    if (parts.size() > options_.max_media_items) {
+    const bool purge = options_.purge_oldest_media;
+    if (!purge && parts.size() > options_.max_media_items) {
         throw ProcessorError(ProcessorErrorKind::BudgetExceeded,
                              "media item count exceeds processor budget");
     }
@@ -571,37 +620,100 @@ ProcessedInput Processor::process(const std::vector<ChatMessage>& messages,
         .max_video_duration_seconds = options_.max_video_duration_seconds,
     };
     ProcessedInput output;
-    std::vector<VisionItem> items;
-    items.reserve(parts.size());
     PreprocessStats stats;
-    stats.media_items = parts.size();
-    for (const ChatPart* part : parts) {
-        Prepared media;
+    // Phase 1: probe (grid + timestamps only, pixel buffers discarded). Anything beyond
+    // the item-count budget is purged without decoding.
+    const std::size_t probed_count =
+        purge ? std::min(parts.size(), options_.max_media_items) : parts.size();
+    const std::size_t count_purged = parts.size() - probed_count;
+    std::vector<VisionItem> items;
+    items.reserve(probed_count);
+    for (std::size_t i = 0; i < probed_count; ++i) {
+        const ChatPart* part = parts[i];
+        VisionItem item;
         try {
-            media = part->kind == ChatPartKind::Image
-                        ? prepare_image(*part, options_, policy, stats)
-                        : prepare_video(*part, options_, policy, stats);
+            item = part->kind == ChatPartKind::Image
+                       ? probe_image(*part, options_, policy)
+                       : probe_video(*part, options_, policy);
         } catch (const media::decode::Error& error) {
             if (error.kind() == media::decode::ErrorKind::BudgetExceeded) {
                 throw ProcessorError(ProcessorErrorKind::BudgetExceeded, error.what());
             }
             throw;
         }
-        media.item.content_digest = sha256(part->media.bytes);
-        if (media.patches.size() % kPatchFeatures != 0) {
-            throw std::logic_error("preprocessed patch buffer is not row aligned");
+        items.push_back(std::move(item));
+    }
+    // Phase 2: budget. With purging on, accumulate everything, then drop the oldest items
+    // until the survivors fit; exactly one item always fits the serve budgets, so the loop
+    // stops with at least one survivor.
+    std::size_t budget_purged = 0;
+    if (purge) {
+        for (const VisionItem& item : items) { add_budget(stats, item); }
+        while (items.size() > 1 &&
+               (stats.raw_patches > options_.max_raw_patches ||
+                stats.vision_tokens > options_.max_vision_tokens ||
+                stats.attention_pairs > options_.max_attention_pairs)) {
+            subtract_budget(stats, items.front());
+            items.erase(items.begin());
+            ++budget_purged;
         }
-        media.item.patch_begin = output.patches.size() / kPatchFeatures;
-        media.item.patch_count = media.patches.size() / kPatchFeatures;
-        output.patches.insert(output.patches.end(), std::make_move_iterator(media.patches.begin()),
-                              std::make_move_iterator(media.patches.end()));
-        items.push_back(std::move(media.item));
+        enforce_budget(stats, options_);
+    } else {
+        for (const VisionItem& item : items) {
+            add_budget(stats, item);
+            enforce_budget(stats, options_);
+        }
+    }
+    stats.media_items       = items.size();
+    stats.media_items_purged = count_purged + budget_purged;
+    // Phase 3: materialize the survivors (one decode at a time, so decoded RAM stays
+    // bounded), in item order, so patch ranges stay canonical.
+    std::vector<VisionItem> survivors;
+    survivors.reserve(items.size());
+    for (std::size_t i = 0; i < items.size(); ++i) {
+        const ChatPart* part = parts[budget_purged + i];
+        try {
+            std::vector<float> patches =
+                part->kind == ChatPartKind::Image
+                    ? materialize_image(*part, items[i], options_, policy)
+                    : materialize_video(*part, items[i], options_, policy);
+            items[i].content_digest = sha256(part->media.bytes);
+            if (patches.size() % kPatchFeatures != 0) {
+                throw std::logic_error("preprocessed patch buffer is not row aligned");
+            }
+            items[i].patch_begin = output.patches.size() / kPatchFeatures;
+            items[i].patch_count = patches.size() / kPatchFeatures;
+            output.patches.insert(output.patches.end(),
+                                  std::make_move_iterator(patches.begin()),
+                                  std::make_move_iterator(patches.end()));
+        } catch (const media::decode::Error& error) {
+            if (error.kind() == media::decode::ErrorKind::BudgetExceeded) {
+                throw ProcessorError(ProcessorErrorKind::BudgetExceeded, error.what());
+            }
+            throw;
+        }
+        survivors.push_back(std::move(items[i]));
     }
     if (output.patches.size() / kPatchFeatures != stats.raw_patches) {
         throw std::logic_error("preprocessed patch count does not match processor budget");
     }
-
-    rendered                     = expand_placeholders(std::move(rendered), items);
+    // Phase 4: expand every rendered placeholder — survivors to pad tokens, purged items
+    // to a short text marker, so the chat still explains where media used to be.
+    std::vector<PlaceholderEntry> entries;
+    entries.reserve(parts.size());
+    for (std::size_t i = 0; i < parts.size(); ++i) {
+        PlaceholderEntry entry;
+        if (i >= budget_purged && i < probed_count) {
+            entry.item    = survivors[i - budget_purged];
+            entry.removed = false;
+        } else {
+            entry.item.modality =
+                parts[i]->kind == ChatPartKind::Image ? Modality::Image : Modality::Video;
+            entry.removed = true;
+        }
+        entries.push_back(std::move(entry));
+    }
+    rendered = expand_placeholders(std::move(rendered), entries);
     EncodedChat encoded          = encode_rendered_chat(tokenizer_, rendered);
     output.input_ids             = std::move(encoded.input_ids);
     output.turn_rewrite_boundary = encoded.turn_rewrite_boundary;
@@ -616,7 +728,7 @@ ProcessedInput Processor::process(const std::vector<ChatMessage>& messages,
     stats.prompt_tokens = output.input_ids.size();
     enforce_budget(stats, options_);
 
-    output.vision_items = std::move(items);
+    output.vision_items = std::move(survivors);
     stats.patch_bytes   = output.patches.size() * sizeof(float);
     output.stats        = stats;
     assign_positions(output);
