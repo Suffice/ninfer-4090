@@ -1,6 +1,7 @@
 #include "targets/qwen3_6/impl/frontend/chat_template.h"
 
 #include "targets/qwen3_6/impl/frontend/digest.h"
+#include "targets/qwen3_6/impl/frontend/processor.h"
 
 #include <nlohmann/json.hpp>
 
@@ -169,7 +170,7 @@ std::string parameter_text(const OrderedJson& value) {
 
 std::string render_tool_call(const ToolCall& call, bool allow_empty_arguments) {
     if (allow_empty_arguments && call.arguments_json.empty()) {
-        return "<tool_call>\n<function=" + call.name + ">\n</function>\n</tool_call>";
+        return neutralize_vision_pads("<tool_call>\n<function=" + call.name + ">\n</function>\n</tool_call>");
     }
     OrderedJson args = OrderedJson::parse(call.arguments_json);
     if (!args.is_object()) {
@@ -188,7 +189,7 @@ std::string render_tool_call(const ToolCall& call, bool allow_empty_arguments) {
         rendered += "\n</parameter>\n";
     }
     rendered += "</function>\n</tool_call>";
-    return rendered;
+    return neutralize_vision_pads(rendered);
 }
 
 std::string render_tools_system_block(const std::vector<std::string>& tool_jsons,
@@ -212,7 +213,7 @@ std::string render_tools_system_block(const std::vector<std::string>& tool_jsons
         rendered += merged_system;
     }
     rendered += "<|im_end|>\n";
-    return rendered;
+    return neutralize_vision_pads(rendered);
 }
 
 std::string_view resolve_reasoning_instructions(ChatTemplateSemantics semantics,
@@ -261,7 +262,7 @@ std::string ChatMessage::rendered_content(bool add_vision_id, int* image_count,
     for (const ChatPart& part : parts) {
         switch (part.kind) {
         case ChatPartKind::Text:
-            out += part.text;
+            out += neutralize_vision_pads(part.text);
             break;
         case ChatPartKind::Image:
             ++images;
@@ -396,7 +397,7 @@ RenderedChat CompiledChatTemplate::render(const std::vector<ChatMessage>& messag
             reasoning        = std::move(parts.reasoning);
             body             = std::move(parts.content);
         }
-        reasoning = trim_ascii_whitespace(reasoning);
+        reasoning = trim_ascii_whitespace(neutralize_vision_pads(reasoning));
 
         const bool preserve_thinking = options.preserve_thinking.value_or(effort_template);
         const bool keep_thinking = preserve_thinking || (static_cast<long>(i) > last_query_index);

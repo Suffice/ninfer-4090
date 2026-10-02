@@ -10,6 +10,7 @@
 #include <optional>
 #include <stdexcept>
 #include <string>
+#include <string_view>
 #include <utility>
 #include <vector>
 
@@ -119,6 +120,10 @@ struct EncodedChat {
 
 EncodedChat encode_rendered_chat(const Tokenizer& tokenizer, const RenderedChat& rendered);
 
+
+// Replace literal image/video pad strings in client-supplied text with a plain-text marker,
+// so client text cannot tokenize into unbound vision placeholders and fail the request.
+std::string neutralize_vision_pads(std::string_view text);
 class Processor {
 public:
     Processor(const Tokenizer& tokenizer, const CompiledChatTemplate& chat_template,

@@ -549,6 +549,29 @@ void validate_special_token(const Tokenizer& tokenizer, std::string_view text, i
 
 } // namespace
 
+std::string neutralize_vision_pads(std::string_view text) {
+    std::string out;
+    out.reserve(text.size());
+    std::size_t search = 0;
+    while (true) {
+        const std::size_t image = text.find(kImagePad, search);
+        const std::size_t video = text.find(kVideoPad, search);
+        const std::size_t next  = std::min(image, video);
+        if (next == std::string_view::npos) {
+            out.append(text.substr(search));
+            return out;
+        }
+        out.append(text.substr(search, next - search));
+        if (next == image) {
+            out += "<image_pad>";
+            search = next + kImagePad.size();
+        } else {
+            out += "<video_pad>";
+            search = next + kVideoPad.size();
+        }
+    }
+}
+
 std::string PreprocessStats::summary() const {
     std::ostringstream out;
     out << "media=" << media_items << " purged=" << media_items_purged
