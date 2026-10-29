@@ -1,0 +1,26 @@
+# Versioned for history, diff and agent undo/redo. NOT a remote-backed repo:
+# nothing here is ever pushed. This lane is mostly engine install state - 19.7 GB
+# of binaries and model data - so the repo tracks only text config; the engine's
+# flags live once in local-AI/scripts/run-ninfer-serve.ps1.
+
+# Engine binaries, their .bak rollback copies and shipped DLLs
+*.exe
+*.exe.bak*
+*.bak-*
+*.dll
+
+# Model weights and ninfer's own model/profile store (18.2 GB)
+Models/
+*.ninfer
+*.metadata
+*.ddi
+*.obj
+CMakeFiles/
+
+# Runtime logs (request-log.jsonl alone is 134 MB)
+logs/
+*.log
+*.jsonl
+
+scratch/
+tmp*.log
