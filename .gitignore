@@ -25,7 +25,7 @@ logs/
 scratch/
 tmp*.log
 
-# --- fleet sensitive block (2026-11-07): secrets, keys, env, local dbs, scratch ---
+# --- fleet sensitive block (2026-11-07): secrets, keys, env, local dbs ---
 .env
 .env.*
 *.env
@@ -59,7 +59,3 @@ cookies*.txt
 *.db-shm
 *.sqlite
 *.sqlite3
-scratch/
-scratch-db/
-node_modules/
-.venv/
