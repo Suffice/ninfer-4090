@@ -1,0 +1,47 @@
+{
+  "$schema": "https://opencode.ai/config.json",
+  "agents": {
+    "amdroid-agent": {
+      "mode": "subagent"
+    },
+    "android-agent": {
+      "mode": "subagent"
+    },
+    "asuswrt-router-agent": {
+      "mode": "subagent"
+    },
+    "blender-agent": {
+      "mode": "subagent"
+    },
+    "cad-agent": {
+      "mode": "subagent"
+    },
+    "chat-agent": {
+      "mode": "subagent"
+    },
+    "fold-vault-agent": {
+      "mode": "subagent"
+    },
+    "home-status-agent": {
+      "mode": "subagent"
+    },
+    "local-ai-agent": {
+      "mode": "subagent"
+    },
+    "media-ops-agent": {
+      "mode": "subagent"
+    },
+    "overseer-agent": {
+      "mode": "subagent"
+    },
+    "proxmox-agent": {
+      "mode": "subagent"
+    },
+    "research-agent": {
+      "mode": "subagent"
+    },
+    "research-sub": {
+      "mode": "subagent"
+    }
+  }
+}
