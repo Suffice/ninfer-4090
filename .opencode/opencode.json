@@ -42,6 +42,9 @@
     },
     "research-sub": {
       "mode": "subagent"
+    },
+    "offline-wikipedia-agent": {
+      "mode": "subagent"
     }
   }
 }
