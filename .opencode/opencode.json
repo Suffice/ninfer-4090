@@ -45,6 +45,9 @@
     },
     "offline-wikipedia-agent": {
       "mode": "subagent"
+    },
+    "health-agent": {
+      "mode": "subagent"
     }
   }
 }
